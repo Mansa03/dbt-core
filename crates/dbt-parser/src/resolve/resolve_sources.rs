@@ -5,6 +5,7 @@ use crate::resolve::resolve_utils::extract_config_map;
 use crate::utils::{extract_resource_config_from_raw_project, get_node_fqn};
 use crate::validation::check_node_static_analysis;
 
+use dbt_adapter::{catalog_relation::sanitize_duckdb_identifier, load_catalogs};
 use dbt_adapter_core::AdapterType;
 use dbt_common::io_args::{StaticAnalysisKind, StaticAnalysisOffReason};
 use dbt_common::tracing::emit::{emit_error_log_from_fs_error, emit_warn_log_from_fs_error};
@@ -17,6 +18,8 @@ use dbt_schemas::schemas::common::{
     DbtChecksum, DbtMaterialization, DbtQuoting, FreshnessDefinition, FreshnessRules,
     NodeDependsOn, merge_meta, merge_tags, normalize_quoting,
 };
+use dbt_schemas::schemas::dbt_catalogs::DbtCatalogs;
+use dbt_schemas::schemas::dbt_catalogs_v2::V2CatalogType;
 use dbt_schemas::schemas::dbt_column::process_columns;
 use dbt_schemas::schemas::project::SourceConfig;
 use dbt_schemas::schemas::properties::{SourceProperties, Tables};
@@ -179,6 +182,134 @@ fn build_source_unrendered_config(
     unrendered
 }
 
+struct ResolvedSourceRelation {
+    database: String,
+    schema: String,
+    catalog_name: Option<String>,
+}
+
+struct SourceCatalogDefaults {
+    catalog_name: String,
+    database: Option<String>,
+    schema: Option<String>,
+}
+
+fn resolve_source_database_and_schema(
+    adapter_type: AdapterType,
+    source: &SourceProperties,
+    default_database: &str,
+    catalogs: Option<&Arc<DbtCatalogs>>,
+    use_catalogs_v2: bool,
+) -> FsResult<ResolvedSourceRelation> {
+    let catalog_defaults =
+        source_catalog_defaults(adapter_type, source, catalogs, use_catalogs_v2)?;
+
+    Ok(ResolvedSourceRelation {
+        database: catalog_defaults
+            .as_ref()
+            .and_then(|defaults| defaults.database.clone())
+            .or_else(|| source.database.clone())
+            .or_else(|| source.catalog.clone())
+            .unwrap_or_else(|| default_database.to_owned()),
+        schema: source
+            .schema
+            .clone()
+            .or_else(|| {
+                catalog_defaults
+                    .as_ref()
+                    .and_then(|defaults| defaults.schema.clone())
+            })
+            .unwrap_or_else(|| source.name.clone()),
+        catalog_name: catalog_defaults.map(|defaults| defaults.catalog_name),
+    })
+}
+
+fn source_catalog_defaults(
+    adapter_type: AdapterType,
+    source: &SourceProperties,
+    catalogs: Option<&Arc<DbtCatalogs>>,
+    use_catalogs_v2: bool,
+) -> FsResult<Option<SourceCatalogDefaults>> {
+    if adapter_type != AdapterType::DuckDB || !use_catalogs_v2 {
+        return Ok(None);
+    }
+
+    let Some(catalog_name) = source
+        .catalog
+        .as_deref()
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+    else {
+        return Ok(None);
+    };
+
+    let Some(catalogs) = catalogs else {
+        return Ok(None);
+    };
+    let view = catalogs.view_v2().map_err(|err| {
+        dbt_common::fs_err!(
+            ErrorCode::InvalidConfig,
+            "Failed to parse catalogs.yml v2 while resolving source catalog '{}': {}",
+            catalog_name,
+            err
+        )
+    })?;
+    let Some(catalog) = view
+        .catalogs
+        .iter()
+        .find(|catalog| catalog.name == catalog_name)
+    else {
+        return Ok(None);
+    };
+
+    if !matches!(
+        catalog.catalog_type,
+        V2CatalogType::Glue
+            | V2CatalogType::IcebergRest
+            | V2CatalogType::DuckLake
+            | V2CatalogType::LocalFilesystem
+    ) {
+        return Err(dbt_common::fs_err!(
+            ErrorCode::InvalidConfig,
+            "Source catalog '{}' has type '{}'; DuckDB sources support only 'glue', 'iceberg_rest', 'ducklake', and 'local_filesystem'",
+            catalog_name,
+            catalog.catalog_type.as_str()
+        ));
+    }
+
+    let Some(duckdb) = catalog.config_block("duckdb") else {
+        return Err(dbt_common::fs_err!(
+            ErrorCode::InvalidConfig,
+            "Source catalog '{}' is defined in catalogs.yml but has no DuckDB config",
+            catalog_name
+        ));
+    };
+    let get_str = |key: &str| {
+        duckdb
+            .get(dbt_yaml::Value::from(key))
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(ToString::to_string)
+    };
+
+    let database = match catalog.catalog_type {
+        V2CatalogType::Glue
+        | V2CatalogType::IcebergRest
+        | V2CatalogType::DuckLake => Some(sanitize_duckdb_identifier(
+            get_str("attach_as").as_deref().unwrap_or(catalog.name),
+        )),
+        V2CatalogType::LocalFilesystem => Some(catalog.name.to_string()),
+        _ => unreachable!("unsupported DuckDB source catalog type rejected above"),
+    };
+
+    Ok(Some(SourceCatalogDefaults {
+        catalog_name: catalog_name.to_string(),
+        database,
+        schema: get_str("default_schema"),
+    }))
+}
+
 #[allow(clippy::too_many_arguments, clippy::type_complexity)]
 pub async fn resolve_sources(
     arg: &ResolveArgs,
@@ -242,6 +373,9 @@ pub async fn resolve_sources(
             arg.static_analysis.unwrap_or_default(),
             root_package.dbt_project.sync.clone(),
         ));
+    let catalogs = load_catalogs::fetch_catalogs();
+    let use_catalogs_v2 = load_catalogs::fetch_use_catalogs_v2();
+
     for ((source_name, table_name), mpe) in source_properties.into_iter() {
         // Extract raw (unrendered) database and schema from the YAML before Jinja rendering.
         // These preserve Jinja templates like `{{ env_var('DBT_ENV') }}` for state comparisons.
@@ -282,12 +416,17 @@ pub async fn resolve_sources(
             dependency_package_name,
             true,
         )?;
-        let database: String = source
-            .database
-            .clone()
-            .or_else(|| source.catalog.clone())
-            .unwrap_or_else(|| database.to_owned());
-        let schema = source.schema.clone().unwrap_or_else(|| source.name.clone());
+        let ResolvedSourceRelation {
+            database,
+            schema,
+            catalog_name: source_catalog_name,
+        } = resolve_source_database_and_schema(
+            adapter_type,
+            &source,
+            database,
+            catalogs.as_ref(),
+            use_catalogs_v2,
+        )?;
 
         let fqn = get_node_fqn(
             package_name,
@@ -311,7 +450,7 @@ pub async fn resolve_sources(
         // overrides, but they are still handled here so that source_config carries the fully
         // merged state (used by process_columns and deprecated_config).
         // See: https://github.com/dbt-labs/dbt-fusion/issues/767
-        let source_config = config_resolver.try_resolve_with_overrides(
+        let mut source_config = config_resolver.try_resolve_with_overrides(
             &fqn,
             &fqn,
             &[source.config.as_ref()],
@@ -368,6 +507,14 @@ pub async fn resolve_sources(
                 Ok(())
             },
         )?;
+        if let Some(source_catalog_name) = source_catalog_name
+            && source_config
+                .__warehouse_specific_config__
+                .catalog_name
+                .is_none()
+        {
+            source_config.__warehouse_specific_config__.catalog_name = Some(source_catalog_name);
+        }
 
         check_node_static_analysis(
             &source_config,
@@ -757,6 +904,128 @@ mod tests {
     use super::*;
     use dbt_jinja_utils::serde::Omissible;
     use dbt_schemas::schemas::common::{FreshnessDefinition, FreshnessPeriod, FreshnessRules};
+    use dbt_schemas::schemas::dbt_catalogs_v2::validate_catalogs_v2;
+    use std::path::Path;
+
+    fn load_v2_catalogs(yaml: &str) -> Arc<DbtCatalogs> {
+        let parsed: dbt_yaml::Value = dbt_yaml::from_str(yaml).expect("valid catalogs yaml");
+        let (repr, span) = match parsed {
+            dbt_yaml::Value::Mapping(mapping, span) => (mapping, span),
+            _ => panic!("expected top-level mapping"),
+        };
+        let catalogs = DbtCatalogs::new(repr, span);
+        let view = catalogs.view_v2().expect("valid v2 catalogs view");
+        validate_catalogs_v2(&view, Path::new("<test>")).expect("valid v2 catalogs");
+        Arc::new(catalogs)
+    }
+
+    fn iceberg_rest_catalogs() -> Arc<DbtCatalogs> {
+        load_v2_catalogs(
+            r#"
+catalogs:
+  - name: remote_rest
+    type: iceberg_rest
+    table_format: iceberg
+    config:
+      duckdb:
+        endpoint: "https://rest.example.com"
+        warehouse: "demo"
+        attach_as: "rest_attached"
+        default_schema: "raw_default"
+"#,
+        )
+    }
+
+    fn source_properties(
+        name: &str,
+        catalog: Option<&str>,
+        database: Option<&str>,
+        schema: Option<&str>,
+    ) -> SourceProperties {
+        SourceProperties {
+            config: None,
+            database: database.map(ToString::to_string),
+            schema: schema.map(ToString::to_string),
+            catalog: catalog.map(ToString::to_string),
+            description: None,
+            loader: None,
+            name: name.to_string(),
+            quoting: None,
+            tables: None,
+        }
+    }
+
+    #[test]
+    fn duckdb_source_catalog_uses_catalog_defaults() {
+        let catalogs = iceberg_rest_catalogs();
+        let source = source_properties(
+            "logical_source",
+            Some("remote_rest"),
+            Some("ignored_database"),
+            None,
+        );
+
+        let resolved = resolve_source_database_and_schema(
+            AdapterType::DuckDB,
+            &source,
+            "target_database",
+            Some(&catalogs),
+            true,
+        )
+        .unwrap();
+
+        assert_eq!(resolved.database, "rest_attached");
+        assert_eq!(resolved.schema, "raw_default");
+        assert_eq!(resolved.catalog_name.as_deref(), Some("remote_rest"));
+    }
+
+    #[test]
+    fn duckdb_source_catalog_allows_source_schema_override() {
+        let catalogs = iceberg_rest_catalogs();
+        let source = source_properties(
+            "logical_source",
+            Some("remote_rest"),
+            None,
+            Some("source_schema"),
+        );
+
+        let resolved = resolve_source_database_and_schema(
+            AdapterType::DuckDB,
+            &source,
+            "target_database",
+            Some(&catalogs),
+            true,
+        )
+        .unwrap();
+
+        assert_eq!(resolved.database, "rest_attached");
+        assert_eq!(resolved.schema, "source_schema");
+        assert_eq!(resolved.catalog_name.as_deref(), Some("remote_rest"));
+    }
+
+    #[test]
+    fn duckdb_source_catalog_falls_back_without_catalogs_v2() {
+        let catalogs = iceberg_rest_catalogs();
+        let source = source_properties(
+            "logical_source",
+            Some("remote_rest"),
+            Some("source_database"),
+            None,
+        );
+
+        let resolved = resolve_source_database_and_schema(
+            AdapterType::DuckDB,
+            &source,
+            "target_database",
+            Some(&catalogs),
+            false,
+        )
+        .unwrap();
+
+        assert_eq!(resolved.database, "source_database");
+        assert_eq!(resolved.schema, "logical_source");
+        assert_eq!(resolved.catalog_name, None);
+    }
 
     #[test]
     fn test_merge_event_time_table_overrides_source() {
