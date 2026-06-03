@@ -204,6 +204,12 @@ fn resolve_source_database_and_schema(
     let catalog_defaults =
         source_catalog_defaults(adapter_type, source, catalogs, use_catalogs_v2)?;
 
+    // Precedence:
+    // - `source.catalog` selects a catalogs.yml entry and routes `database` to
+    //   that DuckDB attachment alias. That keeps `source()` references on the
+    //   selected catalog even when old source YAML also has `database`.
+    // - `source.schema` is an explicit table namespace override.
+    // - catalog `default_schema` fills schema only when the source omits one.
     Ok(ResolvedSourceRelation {
         database: catalog_defaults
             .as_ref()
@@ -230,6 +236,9 @@ fn source_catalog_defaults(
     catalogs: Option<&Arc<DbtCatalogs>>,
     use_catalogs_v2: bool,
 ) -> FsResult<Option<SourceCatalogDefaults>> {
+    // The source schema already exposes `catalog`; for DuckDB catalogs v2 we
+    // interpret it as a reference to catalogs.yml and derive the attached
+    // database/default schema from that catalog's `config.duckdb` block.
     if adapter_type != AdapterType::DuckDB || !use_catalogs_v2 {
         return Ok(None);
     }
@@ -265,13 +274,14 @@ fn source_catalog_defaults(
     if !matches!(
         catalog.catalog_type,
         V2CatalogType::Glue
+            | V2CatalogType::Horizon
             | V2CatalogType::IcebergRest
             | V2CatalogType::DuckLake
             | V2CatalogType::LocalFilesystem
     ) {
         return Err(dbt_common::fs_err!(
             ErrorCode::InvalidConfig,
-            "Source catalog '{}' has type '{}'; DuckDB sources support only 'glue', 'iceberg_rest', 'ducklake', and 'local_filesystem'",
+            "Source catalog '{}' has type '{}'; DuckDB sources support only 'horizon', 'glue', 'iceberg_rest', 'ducklake', and 'local_filesystem'",
             catalog_name,
             catalog.catalog_type.as_str()
         ));
@@ -295,6 +305,7 @@ fn source_catalog_defaults(
 
     let database = match catalog.catalog_type {
         V2CatalogType::Glue
+        | V2CatalogType::Horizon
         | V2CatalogType::IcebergRest
         | V2CatalogType::DuckLake => Some(sanitize_duckdb_identifier(
             get_str("attach_as").as_deref().unwrap_or(catalog.name),
@@ -936,6 +947,24 @@ catalogs:
         )
     }
 
+    fn horizon_catalogs() -> Arc<DbtCatalogs> {
+        load_v2_catalogs(
+            r#"
+catalogs:
+  - name: snowflake_horizon
+    type: horizon
+    table_format: iceberg
+    config:
+      duckdb:
+        endpoint: "https://snowflake.example.com/polaris/api/catalog"
+        warehouse: "HORIZON_CATALOG"
+        secret: horizon_oauth
+        attach_as: "horizon_attached"
+        default_schema: "DEMO"
+"#,
+        )
+    }
+
     fn source_properties(
         name: &str,
         catalog: Option<&str>,
@@ -977,6 +1006,25 @@ catalogs:
         assert_eq!(resolved.database, "rest_attached");
         assert_eq!(resolved.schema, "raw_default");
         assert_eq!(resolved.catalog_name.as_deref(), Some("remote_rest"));
+    }
+
+    #[test]
+    fn duckdb_source_catalog_supports_horizon_defaults() {
+        let catalogs = horizon_catalogs();
+        let source = source_properties("logical_source", Some("snowflake_horizon"), None, None);
+
+        let resolved = resolve_source_database_and_schema(
+            AdapterType::DuckDB,
+            &source,
+            "target_database",
+            Some(&catalogs),
+            true,
+        )
+        .unwrap();
+
+        assert_eq!(resolved.database, "horizon_attached");
+        assert_eq!(resolved.schema, "DEMO");
+        assert_eq!(resolved.catalog_name.as_deref(), Some("snowflake_horizon"));
     }
 
     #[test]
