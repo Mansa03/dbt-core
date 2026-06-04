@@ -760,3 +760,19 @@ jobs:
           fi
 
           gh release upload "$TAG" --clobber "${ASSETS[@]}"
+
+  # Renders Formula/dbt-core.rb from the SHA256SUMS just uploaded by the
+  # `github-release` job and pushes it to dbt-labs/homebrew-dbt. Skipped
+  # for pre-release versions (anything with a `-` in the SemVer) — brew
+  # users only get stable releases.
+  publish-homebrew:
+    needs: [prepare-release, github-release]
+    if: ${{ !inputs.dry_run && !contains(needs.prepare-release.outputs.version, '-') }}
+    uses: ./.github/workflows/publish-homebrew.yml
+    with:
+      version: ${{ needs.prepare-release.outputs.version }}
+      tag: ${{ needs.prepare-release.outputs.tag }}
+      dry_run: false
+    permissions:
+      contents: read
+    secrets: inherit
